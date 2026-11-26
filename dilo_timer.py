@@ -1,343 +1,577 @@
 # -*- coding: utf-8 -*-
-"""
-IE DILO 计时工具 - Streamlit 后端版（方案B）
-========================================
-核心特性：
-  1. 动作编码 N1~N100，说明 NT1~NT100（可自定义添加）
-  2. 序号列（第一列，按行自动计数）+ 备注列（最后一列）
-  3. 备注编辑：选行号 -> 显示动作编码 -> 输入备注 -> 更新
-  4. 计时：开始 / 停止 / 重置（重置二次确认，防误触）
-  5. 切换编码自动保存上一段记录，并重置当前计时重新计数
-  6. 【关键】每录一条记录，自动追加写入同一个 Excel 文件，不丢数据
-  7. 累计总时长 + 记录条数统计
-  8. 重置初始页面数据：还原编码表 + 清空记录 + 重置计时
+"""DILO activity timer implemented with Streamlit."""
 
-依赖安装：
-  pip install streamlit pandas openpyxl
-（计时器已改为前端 JS 本地跳字，运行时零网络请求，无需 streamlit-autorefresh）
+from __future__ import annotations
 
-运行：
-  streamlit run dilo_timer.py
-  python -m streamlit run dilo_timer.py
-"""
-
-import streamlit as st
-import streamlit.components.v1 as components
-import pandas as pd
-import time
-import os
 from datetime import datetime
+from io import BytesIO
+import time
 
-st.set_page_config(page_title="IE DILO 计时工具", page_icon="⏱️", layout="wide")
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+import streamlit as st
 
-# ============ 配置 ============
-EXCEL_FILE = "DILO记录.xlsx"      # 所有记录追加到同一个文件
-CODE_FILE  = "DILO编码表.xlsx"    # 编码对照表（可自定义）
-COLUMNS    = ["动作编码", "动作说明", "时长(秒)", "时长(时分秒)", "记录时间", "备注"]
-DEFAULT_CODE = {f"N{i}": f"NT{i}" for i in range(1, 101)}
 
-# ============ 工具函数 ============
-def pad(n):
-    return str(int(n)).zfill(2)
+st.set_page_config(
+    page_title="DILO | 活动计时器",
+    page_icon="⏱️",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
-def fmt_time(sec):
-    """秒 -> HH:MM:SS:CC"""
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    c = int((sec - int(sec)) * 100)
-    return f"{pad(h)}:{pad(m)}:{pad(s)}:{pad(c)}"
+DEFAULT_CODE_TABLE = {f"N{i}": f"NT{i}" for i in range(1, 101)}
+RECORD_COLUMNS = [
+    "序号",
+    "动作编码",
+    "动作说明",
+    "时长(秒)",
+    "时长(时分秒)",
+    "记录时间",
+    "备注",
+]
 
-def now_str():
-    now = datetime.now()
-    return f"{now.year}-{pad(now.month)}-{pad(now.day)} {pad(now.hour)}:{pad(now.minute)}:{pad(now.second)}"
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700;800&display=swap');
+    :root {
+        --ink: #172533;
+        --muted: #718091;
+        --blue: #1769aa;
+        --blue-dark: #12558a;
+        --line: #e5ebf1;
+        --surface: #ffffff;
+        --canvas: #f3f6f9;
+    }
+    .stApp {
+        background:
+            radial-gradient(ellipse at 12% 0%, rgba(52, 140, 207, .10), transparent 34rem),
+            var(--canvas);
+        color: var(--ink);
+        font-family: 'Manrope', 'Noto Sans SC', sans-serif;
+    }
+    .block-container { max-width: 860px; padding: 2rem 1.15rem 3rem; }
+    header[data-testid="stHeader"] { background: transparent; }
+    h1, h2, h3, p, label { font-family: 'Manrope', 'Noto Sans SC', sans-serif; }
+    .hero {
+        display:flex; align-items:center; gap:14px; margin: 0 0 18px;
+    }
+    .hero-mark {
+        width:48px; height:48px; display:grid; place-items:center;
+        border-radius:15px; color:#fff; font-size:24px;
+        background:linear-gradient(145deg,#3192d1,#12558a);
+        box-shadow:0 8px 20px rgba(23,105,170,.20);
+    }
+    .hero-title { font-size:25px; line-height:1.15; font-weight:800; letter-spacing:-.5px; }
+    .hero-subtitle { margin-top:5px; color:var(--muted); font-size:13px; }
+    .timer-card {
+        position:relative; overflow:hidden; padding:22px 18px 20px;
+        border:1px solid rgba(220,230,239,.9); border-radius:22px;
+        background:linear-gradient(145deg,#fff,#f8fbfd);
+        box-shadow:0 12px 32px rgba(32,61,83,.07);
+    }
+    .timer-kicker { color:var(--muted); text-align:center; font-size:12px; font-weight:700; letter-spacing:1.6px; text-transform:uppercase; }
+    .timer-readout {
+        margin:9px 0 14px; color:#1769aa; text-align:center;
+        font:500 clamp(2.15rem, 11vw, 4.3rem)/1.1 'DM Mono', monospace;
+        font-variant-numeric:tabular-nums; letter-spacing:-2px; white-space:nowrap;
+    }
+    .status-row { display:flex; align-items:center; justify-content:center; gap:8px; color:var(--muted); font-size:12px; }
+    .status-dot { width:8px; height:8px; border-radius:50%; background:#9aa8b5; }
+    .status-dot.running { background:#28a36a; box-shadow:0 0 0 4px rgba(40,163,106,.12); }
+    .metric-strip {
+        display:flex; justify-content:center; gap:0; margin-top:16px;
+        border-top:1px solid var(--line); padding-top:14px;
+    }
+    .metric-item { text-align:center; padding:0 18px; }
+    .metric-item + .metric-item { border-left:1px solid var(--line); }
+    .metric-label { color:var(--muted); font-size:11px; }
+    .metric-value { margin-top:3px; color:var(--ink); font-size:15px; font-weight:700; font-variant-numeric:tabular-nums; }
+    .section-label {
+        margin:23px 0 9px; color:#516173; font-size:12px;
+        font-weight:800; letter-spacing:.6px;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border-color:var(--line); border-radius:16px; background:var(--surface);
+    }
+    div[data-testid="stButton"] > button, div[data-testid="stDownloadButton"] > button {
+        min-height:44px; border-radius:11px; font-weight:700;
+        transition:transform .12s ease, box-shadow .12s ease;
+    }
+    div[data-testid="stButton"] > button:hover, div[data-testid="stDownloadButton"] > button:hover {
+        transform:translateY(-1px); box-shadow:0 5px 14px rgba(23,105,170,.12);
+    }
+    div[data-testid="stTextInput"] input, div[data-testid="stSelectbox"] [role="combobox"] {
+        border-radius:10px;
+    }
+    div[data-testid="stAlert"] { border-radius:12px; }
+    div[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+    .fine-print { margin-top:15px; color:var(--muted); font-size:11px; text-align:center; }
+    @media (max-width: 600px) {
+        .block-container { padding:1.2rem .8rem 2rem; }
+        .hero-title { font-size:22px; }
+        .timer-card { padding:19px 11px 16px; border-radius:18px; }
+        .metric-item { padding:0 10px; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ============ 数据加载 / 保存 ============
-def load_records():
-    """从 Excel 读取历史记录（记录自动累积在同一个文件）"""
-    if os.path.exists(EXCEL_FILE):
-        try:
-            df = pd.read_excel(EXCEL_FILE, engine="openpyxl")
-            for c in COLUMNS:
-                if c not in df.columns:
-                    df[c] = ""
-            return df[COLUMNS]
-        except Exception as e:
-            st.warning(f"读取记录文件失败：{e}")
-    return pd.DataFrame(columns=COLUMNS)
 
-def save_records(df):
-    """把完整记录写回同一个 Excel 文件"""
-    df.to_excel(EXCEL_FILE, index=False, engine="openpyxl")
+def fmt_time(seconds: float) -> str:
+    """Format seconds as HH:MM:SS:CC, matching the original timer."""
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    whole_seconds = int(seconds % 60)
+    centiseconds = int((seconds - int(seconds)) * 100)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}:{centiseconds:02d}"
 
-def load_code_table():
-    """编码表：优先读文件，否则用默认 N1~N100"""
-    if os.path.exists(CODE_FILE):
-        try:
-            cdf = pd.read_excel(CODE_FILE, engine="openpyxl")
-            return {str(k): str(v) for k, v in zip(cdf["动作编码"], cdf["动作说明"])}
-        except Exception:
-            pass
-    return dict(DEFAULT_CODE)
 
-def save_code_table(ct):
-    cdf = pd.DataFrame([{"动作编码": k, "动作说明": v} for k, v in ct.items()])
-    cdf.to_excel(CODE_FILE, index=False, engine="openpyxl")
+def init_state() -> None:
+    defaults = {
+        "records": [],
+        "code_table": dict(DEFAULT_CODE_TABLE),
+        "selected_code": "N1",
+        "last_selected_code": "N1",
+        "running": False,
+        "start_ts": 0.0,
+        "stopped_elapsed": 0.0,
+        "quick_remark": "",
+        "reset_confirm_until": 0.0,
+        "clear_confirm_until": 0.0,
+        "clear_password_visible": False,
+        "show_records": False,
+        "selected_record": 0,
+        "notice": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    if "action_description" not in st.session_state:
+        st.session_state.action_description = st.session_state.code_table.get(
+            st.session_state.selected_code, ""
+        )
 
-# ============ 会话状态初始化 ============
-def init_state():
-    if "records" not in st.session_state:
-        st.session_state.records = load_records()
-    if "code_table" not in st.session_state:
-        st.session_state.code_table = load_code_table()
-    if "running" not in st.session_state:
+
+def notify(message: str, kind: str = "info") -> None:
+    st.session_state.notice = (kind, message)
+
+
+def record_segment(code: str, duration: float, remark: str = "") -> None:
+    st.session_state.records.append(
+        {
+            "动作编码": code,
+            "动作说明": st.session_state.code_table.get(code, ""),
+            "时长(秒)": round(duration, 2),
+            "时长(时分秒)": fmt_time(duration),
+            "记录时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "备注": remark.strip(),
+        }
+    )
+
+
+def on_code_change() -> None:
+    new_code = st.session_state.selected_code
+    previous_code = st.session_state.get("last_selected_code", new_code)
+    if new_code != previous_code and st.session_state.running:
+        elapsed = max(0.0, time.time() - st.session_state.start_ts)
+        record_segment(previous_code, elapsed, st.session_state.quick_remark)
+        st.session_state.start_ts = time.time()
+        st.session_state.stopped_elapsed = 0.0
+        notify(f"已自动保存 {previous_code} 的记录，时长 {fmt_time(elapsed)}", "success")
+    if new_code != previous_code:
+        st.session_state.quick_remark = ""
+        st.session_state.action_description = st.session_state.code_table.get(new_code, "")
+    st.session_state.last_selected_code = new_code
+
+
+def add_or_update_code() -> None:
+    code = st.session_state.new_code.strip()
+    description = st.session_state.new_description.strip()
+    if not code or not description:
+        notify("请输入动作编码和动作说明。", "warning")
+        return
+    st.session_state.code_table[code] = description
+    st.session_state.new_code = ""
+    st.session_state.new_description = ""
+    notify(f"已成功添加/更新编码：{code} → {description}", "success")
+
+
+def update_description() -> None:
+    code = st.session_state.selected_code
+    description = st.session_state.action_description.strip()
+    if not code:
+        notify("没有可更新的动作编码。", "warning")
+    elif not description:
+        notify("动作说明不能为空。", "warning")
+    else:
+        old_description = st.session_state.code_table.get(code, "")
+        st.session_state.code_table[code] = description
+        notify(f"已更新 {code} 的动作说明：{old_description} → {description}", "success")
+
+
+def load_selected_remark() -> None:
+    index = st.session_state.selected_record
+    if 0 <= index < len(st.session_state.records):
+        st.session_state.remark_editor = st.session_state.records[index].get("备注", "")
+
+
+def update_remark() -> None:
+    index = st.session_state.selected_record
+    if not 0 <= index < len(st.session_state.records):
+        notify("请先选择要编辑的记录行。", "warning")
+        return
+    remark = st.session_state.remark_editor.strip()
+    st.session_state.records[index]["备注"] = remark
+    notify(f"已更新第 {index + 1} 行备注：{remark or '（空）'}", "success")
+
+
+def start_timer() -> None:
+    code = st.session_state.selected_code
+    if st.session_state.running:
+        notify("计时已经在运行中。", "warning")
+    elif not code or not st.session_state.code_table.get(code):
+        notify("请先选择有效的动作编码。", "warning")
+    else:
+        st.session_state.running = True
+        st.session_state.start_ts = time.time()
+        st.session_state.stopped_elapsed = 0.0
+        st.session_state.last_selected_code = code
+        notify(f"计时已启动，当前编码：{code}", "success")
+
+
+def stop_timer() -> None:
+    if not st.session_state.running:
+        notify("计时未启动。", "warning")
+        return
+    elapsed = max(0.0, time.time() - st.session_state.start_ts)
+    code = st.session_state.get("last_selected_code", st.session_state.selected_code)
+    record_segment(code, elapsed, st.session_state.quick_remark)
+    st.session_state.running = False
+    st.session_state.stopped_elapsed = elapsed
+    st.session_state.start_ts = 0.0
+    st.session_state.quick_remark = ""
+    notify(f"已停止并保存 {code} 的记录，时长 {fmt_time(elapsed)}", "success")
+
+
+def reset_timer() -> None:
+    now = time.time()
+    if st.session_state.reset_confirm_until >= now:
         st.session_state.running = False
-    if "start_ts" not in st.session_state:
-        st.session_state.start_ts = 0
-    if "seg_elapsed" not in st.session_state:
-        st.session_state.seg_elapsed = 0.0
-    if "selected_code" not in st.session_state:
-        st.session_state.selected_code = "N1"
-    if "last_code" not in st.session_state:
-        st.session_state.last_code = "N1"
-    if "reset_confirm" not in st.session_state:
-        st.session_state.reset_confirm = False
-    if "show_data" not in st.session_state:
-        st.session_state.show_data = False
+        st.session_state.start_ts = 0.0
+        st.session_state.stopped_elapsed = 0.0
+        st.session_state.reset_confirm_until = 0.0
+        st.session_state.quick_remark = ""
+        notify("计时器已重置（历史记录保留）。", "success")
+    else:
+        st.session_state.reset_confirm_until = now + 5
+        notify("⚠️ 请在 5 秒内再次点击确认重置；历史记录会保留。", "warning")
+
+
+def toggle_records() -> None:
+    st.session_state.show_records = not st.session_state.show_records
+    if not st.session_state.records and st.session_state.show_records:
+        notify("暂无记录。", "info")
+
+
+def request_clear() -> None:
+    now = time.time()
+    if st.session_state.clear_confirm_until >= now:
+        st.session_state.clear_password_visible = True
+        st.session_state.clear_confirm_until = 0.0
+        notify("请输入密码 123 以确认清除全部数据。", "warning")
+    else:
+        st.session_state.clear_confirm_until = now + 5
+        st.session_state.clear_password_visible = False
+        notify("⚠️ 请在 5 秒内再次点击；随后还需输入密码。", "warning")
+
+
+def confirm_clear() -> None:
+    if st.session_state.clear_password.strip() != "123":
+        st.session_state.clear_password = ""
+        notify("密码错误，无法清除数据。", "error")
+        return
+    st.session_state.records = []
+    st.session_state.code_table = {}
+    st.session_state.running = False
+    st.session_state.start_ts = 0.0
+    st.session_state.stopped_elapsed = 0.0
+    st.session_state.quick_remark = ""
+    st.session_state.selected_code = ""
+    st.session_state.last_selected_code = ""
+    st.session_state.action_description = ""
+    st.session_state.clear_password = ""
+    st.session_state.clear_password_visible = False
+    st.session_state.show_records = False
+    st.session_state.selected_record = 0
+    st.session_state.notice = ("success", "✅ 全部缓存数据已清除（编码表和计时记录）。")
+
+
+def cancel_clear() -> None:
+    st.session_state.clear_password = ""
+    st.session_state.clear_password_visible = False
+    st.session_state.clear_confirm_until = 0.0
+    notify("已取消清除操作。", "info")
+
+
+def make_excel() -> bytes:
+    workbook = Workbook()
+    records_sheet = workbook.active
+    records_sheet.title = "计时记录"
+    records_sheet.append(RECORD_COLUMNS)
+    for index, record in enumerate(st.session_state.records, start=1):
+        records_sheet.append(
+            [
+                index,
+                record.get("动作编码", ""),
+                record.get("动作说明", ""),
+                record.get("时长(秒)", 0),
+                record.get("时长(时分秒)", ""),
+                record.get("记录时间", ""),
+                record.get("备注", ""),
+            ]
+        )
+    code_sheet = workbook.create_sheet("编码对照表")
+    code_sheet.append(["动作编码", "动作说明"])
+    for code, description in st.session_state.code_table.items():
+        code_sheet.append([code, description])
+
+    for sheet, widths in (
+        (records_sheet, [8, 14, 24, 14, 20, 22, 32]),
+        (code_sheet, [18, 30]),
+    ):
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1769AA")
+            cell.alignment = Alignment(horizontal="center")
+        for column, width in enumerate(widths, start=1):
+            sheet.column_dimensions[chr(64 + column)].width = width
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def render_timer() -> None:
+    running = st.session_state.running
+    elapsed = (
+        max(0.0, time.time() - st.session_state.start_ts)
+        if running
+        else st.session_state.stopped_elapsed
+    )
+    start_ms = int((time.time() - elapsed) * 1000)
+    state_text = "正在计时" if running else "已暂停"
+    dot_class = "running" if running else ""
+    timer_color = "#1769aa" if running else "#7b8996"
+    st.html(
+        f"""
+        <div class="timer-card">
+          <div class="timer-kicker">当前时段</div>
+          <div id="dilo-clock" class="timer-readout" style="color:{timer_color}">{fmt_time(elapsed)}</div>
+          <div class="status-row"><span class="status-dot {dot_class}"></span><span>{state_text}</span></div>
+        </div>
+        <script>
+        (() => {{
+          const el = document.getElementById("dilo-clock");
+          const running = {str(running).lower()};
+          const start = {start_ms};
+          const pad = (n) => String(Math.floor(n)).padStart(2, "0");
+          const format = (seconds) => {{
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            const c = Math.floor((seconds - Math.floor(seconds)) * 100);
+            return `${{pad(h)}}:${{pad(m)}}:${{pad(s)}}:${{pad(c)}}`;
+          }};
+          function tick() {{
+            if (!running || !el) return;
+            el.textContent = format(Math.max(0, (Date.now() - start) / 1000));
+            requestAnimationFrame(tick);
+          }}
+          if (running) tick();
+        }})();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
+
 
 init_state()
+code_options = list(st.session_state.code_table)
+if code_options and st.session_state.selected_code not in code_options:
+    st.session_state.selected_code = code_options[0]
+    st.session_state.last_selected_code = code_options[0]
+    st.session_state.action_description = st.session_state.code_table[code_options[0]]
 
-# ============ 记录操作 ============
-def add_record(code, desc, duration_sec):
-    """追加一条记录并自动写回 Excel（同一个文档）"""
-    rec = {
-        "动作编码": code,
-        "动作说明": desc,
-        "时长(秒)": round(duration_sec, 2),
-        "时长(时分秒)": fmt_time(duration_sec),
-        "记录时间": now_str(),
-        "备注": "",
-    }
-    df = st.session_state.records
-    df = pd.concat([df, pd.DataFrame([rec])], ignore_index=True)
-    st.session_state.records = df
-    save_records(df)
-    return df
-
-def update_remark(row_index, remark):
-    df = st.session_state.records
-    df.loc[row_index, "备注"] = remark
-    st.session_state.records = df
-    save_records(df)
-
-# ============ 页面 UI ============
-st.title("⏱️ IE DILO 计时工具")
-
-# ---------- 1. 累计总时长 + 当前计时（当前计时在累计总时长下边） ----------
-total_sec = st.session_state.records["时长(秒)"].astype(float).sum() if len(st.session_state.records) else 0.0
-total_sec = float(total_sec)
-st.metric("累计总时长", fmt_time(total_sec), f"记录条数：{len(st.session_state.records)}")
-
-# 前端 JS 计时器（本地跳字，不触发服务器刷新，手机端流畅省电）
-# 仅在开始/停止/切换编码/重置时由 Streamlit 重新渲染一次，运行时零网络请求
-def render_front_timer():
-    start_ms = int(st.session_state.start_ts * 1000) if st.session_state.start_ts else 0
-    running = "true" if st.session_state.running else "false"
-    color = "#2196F3" if st.session_state.running else "#888888"
-    html = f"""
-    <div style="text-align:center;">
-      <div style="font-size:46px;font-weight:bold;color:{color};
-                  font-variant-numeric:tabular-nums;letter-spacing:1px;"
-           id="frontTimer">00:00:00:00</div>
-    </div>
-    <script>
-    (function(){{
-      var running = {running};
-      var startTs = {start_ms};
-      var el = document.getElementById("frontTimer");
-      function pad2(n){{ return (n<10?"0":"")+Math.floor(n); }}
-      function fmt(sec){{
-        var h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60),
-            s=Math.floor(sec%60), c=Math.floor((sec-Math.floor(sec))*100);
-        return pad2(h)+":"+pad2(m)+":"+pad2(s)+":"+pad2(c);
-      }}
-      function update(){{
-        if(!running || !el) return;
-        var sec=(Date.now()-startTs)/1000;
-        if(sec<0) sec=0;
-        el.textContent = fmt(sec);
-        requestAnimationFrame(update);
-      }}
-      if(running) update();
-    }})();
-    </script>
+st.markdown(
     """
-    components.html(html, height=80)
+    <div class="hero">
+      <div class="hero-mark">⏱</div>
+      <div>
+        <div class="hero-title">DILO 活动计时器</div>
+        <div class="hero-subtitle">记录、整理并导出每一段工作活动</div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-# 提前检测编码切换（必须在计时器渲染前处理，保证当前计时正确重置）
-new_code_now = st.session_state.get("sel_code_box", st.session_state.selected_code)
-if new_code_now != st.session_state.last_code:
-    if st.session_state.running:
-        prev_code = st.session_state.last_code
-        prev_desc = st.session_state.code_table.get(prev_code, "")
-        now = time.time()
-        dur = (now - st.session_state.start_ts) + st.session_state.seg_elapsed
-        add_record(prev_code, prev_desc, dur)
-        st.success(f"已自动保存记录 {prev_code}，时长 {fmt_time(dur)}")
-    # 每次更换编码都重置当前计时，重新计数
-    if st.session_state.running:
-        st.session_state.start_ts = time.time()
-    else:
-        st.session_state.start_ts = 0
-    st.session_state.seg_elapsed = 0.0
-    st.session_state.last_code = new_code_now
-    st.session_state.selected_code = new_code_now
+total_seconds = sum(float(record.get("时长(秒)", 0) or 0) for record in st.session_state.records)
+st.markdown(
+    f"""
+    <div class="timer-card" style="padding-bottom:17px">
+      <div class="timer-kicker">DILO TIMER</div>
+      <div class="metric-strip">
+        <div class="metric-item"><div class="metric-label">累计总时长</div><div class="metric-value">{fmt_time(total_seconds)}</div></div>
+        <div class="metric-item"><div class="metric-label">记录条数</div><div class="metric-value">{len(st.session_state.records)}</div></div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+render_timer()
 
-render_front_timer()
-
-# ---------- 2. 编码选择 ----------
-col_c, col_d = st.columns([1, 2])
-with col_c:
-    code_options = list(st.session_state.code_table.keys())
-    sel_code = st.selectbox(
-        "动作编码",
-        code_options,
-        index=code_options.index(st.session_state.selected_code)
-        if st.session_state.selected_code in code_options else 0,
-        key="sel_code_box",
+if st.session_state.notice:
+    notice_kind, notice_text = st.session_state.notice
+    getattr(st, notice_kind if notice_kind in {"success", "warning", "error", "info"} else "info")(
+        notice_text
     )
-with col_d:
-    st.text_input("动作说明（只读）", value=st.session_state.code_table.get(sel_code, ""),
-                  disabled=True)
+    st.session_state.notice = None
 
-# ---------- 3. 新增/覆盖编码 ----------
-with st.expander("➕ 新增 / 覆盖动作编码"):
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c1:
-        new_code = st.text_input("动作编码", key="new_code")
-    with c2:
-        new_desc = st.text_input("动作说明", key="new_desc")
-    with c3:
-        st.write("")
-        st.write("")
-        if st.button("添加", use_container_width=True):
-            nc = new_code.strip()
-            nd = new_desc.strip()
-            if nc and nd:
-                st.session_state.code_table[nc] = nd
-                save_code_table(st.session_state.code_table)
-                st.success(f"已更新编码：{nc} -> {nd}")
-            else:
-                st.warning("请输入动作编码和动作说明")
+st.markdown('<div class="section-label">当前动作</div>', unsafe_allow_html=True)
+code_col, desc_col = st.columns([1, 1.8], gap="medium")
+with code_col:
+    if code_options:
+        selected_code = st.selectbox(
+            "动作编码",
+            code_options,
+            key="selected_code",
+            on_change=on_code_change,
+            label_visibility="collapsed",
+        )
+    else:
+        selected_code = ""
+        st.selectbox("动作编码", ["无可用编码"], disabled=True, label_visibility="collapsed")
+with desc_col:
+    st.text_input("动作说明", key="action_description", placeholder="动作说明")
+st.text_input(
+    "快速备注",
+    key="quick_remark",
+    placeholder="快速备注（切换或停止编码时自动保存到本段记录）",
+    help="填写后，在切换动作编码或停止计时保存时会附加到当前记录。",
+)
+st.button(
+    "更新当前编码的动作说明",
+    on_click=update_description,
+    disabled=not bool(selected_code),
+    use_container_width=True,
+)
 
-# ---------- 4. 备注编辑（移到新增/覆盖动作编码下边） ----------
-with st.expander("✏️ 备注编辑（选择数据行后修改备注）", expanded=False):
-    if len(st.session_state.records) > 0:
-        total_n = len(st.session_state.records)
-        row_labels = [f"第{i+1}行（{r['动作编码']}）"
-                      for i, r in st.session_state.records.iterrows()]
-        sel_row = st.selectbox("选择数据行", range(total_n), format_func=lambda i: row_labels[i], key="sel_row")
-        sel_code_disp = st.session_state.records.loc[sel_row, "动作编码"]
-        cur_remark = st.session_state.records.loc[sel_row, "备注"]
-        c1, c2 = st.columns([1, 3])
-        with c1:
-            st.text_input("动作编码（只读）", value=sel_code_disp, disabled=True)
-        with c2:
-            new_remark = st.text_input("输入备注", value=str(cur_remark) if cur_remark is not None else "", key="remark_input")
-        if st.button("✅ 更新备注"):
-            update_remark(sel_row, new_remark)
-            st.success(f"已更新第 {sel_row+1} 行备注")
-            st.rerun()
+with st.expander("＋ 添加 / 覆盖动作编码", expanded=False):
+    with st.form("add_code_form", clear_on_submit=False):
+        add_code_col, add_desc_col = st.columns([1, 2])
+        with add_code_col:
+            st.text_input("新动作编码", key="new_code", placeholder="例如：N101")
+        with add_desc_col:
+            st.text_input("动作说明", key="new_description", placeholder="例如：整理工作区域")
+        st.form_submit_button("添加或更新编码", on_click=add_or_update_code, use_container_width=True)
+
+st.markdown('<div class="section-label">计时控制</div>', unsafe_allow_html=True)
+start_col, stop_col, reset_col, data_col = st.columns(4, gap="small")
+with start_col:
+    st.button(
+        "▶ 开始",
+        on_click=start_timer,
+        type="primary",
+        use_container_width=True,
+        disabled=not bool(selected_code),
+    )
+with stop_col:
+    st.button("■ 停止并保存", on_click=stop_timer, use_container_width=True)
+with reset_col:
+    reset_pending = st.session_state.reset_confirm_until >= time.time()
+    st.button(
+        "确认重置" if reset_pending else "↺ 重置计时器",
+        on_click=reset_timer,
+        use_container_width=True,
+        type="secondary" if reset_pending else "tertiary",
+    )
+with data_col:
+    st.button(
+        "隐藏数据" if st.session_state.show_records else "查看数据",
+        on_click=toggle_records,
+        use_container_width=True,
+    )
+
+if st.session_state.show_records:
+    st.markdown('<div class="section-label">记录表格</div>', unsafe_allow_html=True)
+    if st.session_state.records:
+        table_rows = [
+            {
+                "序号": index,
+                **record,
+            }
+            for index, record in enumerate(st.session_state.records, start=1)
+        ]
+        st.dataframe(table_rows, use_container_width=True, hide_index=True)
     else:
         st.info("暂无记录")
 
-# ---------- 5. 计时按钮区 ----------
-col_a, col_b, col_c2, col_d2 = st.columns(4)
-with col_a:
-    if st.button("▶ 开始", use_container_width=True, type="primary"):
-        if not st.session_state.running:
-            st.session_state.running = True
-            st.session_state.start_ts = time.time()
-            st.session_state.seg_elapsed = 0.0
-            st.session_state.last_code = sel_code
-            st.rerun()
-with col_b:
-    if st.button("⏸ 停止并保存", use_container_width=True):
-        if st.session_state.running:
-            now = time.time()
-            dur = (now - st.session_state.start_ts) + st.session_state.seg_elapsed
-            add_record(st.session_state.selected_code,
-                       st.session_state.code_table.get(st.session_state.selected_code, ""),
-                       dur)
-            st.session_state.running = False
-            st.session_state.seg_elapsed = 0.0
-            st.success(f"已停止并保存，时长 {fmt_time(dur)}")
-            st.rerun()
-        else:
-            st.warning("计时未启动")
-with col_c2:
-    # 重置计时器：二次确认（防误触）
-    if st.session_state.reset_confirm:
-        if st.button("⚠ 再点一次确认重置", use_container_width=True, type="secondary"):
-            st.session_state.running = False
-            st.session_state.seg_elapsed = 0.0
-            st.session_state.start_ts = 0
-            st.session_state.reset_confirm = False
-            st.info("计时器已重置（历史记录保留）")
-            st.rerun()
-    else:
-        if st.button("↺ 重置计时器", use_container_width=True):
-            st.session_state.reset_confirm = True
-            st.rerun()
-with col_d2:
-    if st.button("📊 查看数据", use_container_width=True):
-        st.session_state.show_data = not st.session_state.get("show_data", False)
-
-# ---------- 6. 数据表格 ----------
-if st.session_state.get("show_data", False):
-    st.subheader("📋 记录表格")
-    if len(st.session_state.records) > 0:
-        disp = st.session_state.records.copy()
-        disp.insert(0, "序号", range(1, len(disp) + 1))
-        st.dataframe(disp, use_container_width=True)
+with st.expander("✎ 编辑记录备注", expanded=False):
+    if st.session_state.records:
+        record_labels = [
+            f"第 {index} 行 · {record.get('动作编码', '')} · {record.get('记录时间', '')}"
+            for index, record in enumerate(st.session_state.records)
+        ]
+        st.selectbox(
+            "选择数据行",
+            options=range(len(record_labels)),
+            format_func=lambda index: record_labels[index],
+            key="selected_record",
+            on_change=load_selected_remark,
+        )
+        selected_record = st.session_state.records[st.session_state.selected_record]
+        st.text_input("动作编码（只读）", value=selected_record.get("动作编码", ""), disabled=True)
+        st.text_input("输入备注", key="remark_editor", placeholder="为所选记录添加备注")
+        st.button("更新备注", on_click=update_remark, use_container_width=True)
     else:
         st.info("暂无记录")
 
-# ---------- 7. 下载 / 重置初始页面数据 ----------
-col_down, col_reset = st.columns(2)
-with col_down:
-    if st.button("📥 下载Excel", use_container_width=True):
-        if len(st.session_state.records) > 0:
-            exp = st.session_state.records.copy()
-            exp.insert(0, "序号", range(1, len(exp) + 1))
-            csv_data = exp.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("点击下载 CSV（可用Excel打开）", csv_data,
-                               f"DILO计时记录_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                               "text/csv")
-        else:
-            st.warning("暂无数据")
-with col_reset:
-    # 重置初始页面数据：二次确认（会清空记录，不可恢复）
-    if st.session_state.get("reset_initial_confirm", False):
-        if st.button("⚠ 再点一次确认重置初始数据", use_container_width=True, type="secondary"):
-            # 还原编码表
-            st.session_state.code_table = dict(DEFAULT_CODE)
-            save_code_table(st.session_state.code_table)
-            # 清空记录（查看数据中的缓存）
-            st.session_state.records = pd.DataFrame(columns=COLUMNS)
-            save_records(st.session_state.records)
-            st.session_state.show_data = False
-            # 重置计时
-            st.session_state.running = False
-            st.session_state.start_ts = 0
-            st.session_state.seg_elapsed = 0.0
-            st.session_state.reset_confirm = False
-            st.session_state.reset_initial_confirm = False
-            st.success("已重置初始页面数据：编码表还原为 N1~N100，记录已清空，计时已归零")
-            st.rerun()
-    else:
-        if st.button("🗑 重置初始页面数据", use_container_width=True):
-            st.session_state.reset_initial_confirm = True
-            st.rerun()
+st.markdown('<div class="section-label">导出与数据管理</div>', unsafe_allow_html=True)
+export_col, clear_col = st.columns(2, gap="medium")
+with export_col:
+    st.download_button(
+        "下载 Excel 工作簿",
+        data=make_excel(),
+        file_name=f"DILO计时记录_{datetime.now():%Y-%m-%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=not bool(st.session_state.records),
+        use_container_width=True,
+        help="包含「计时记录」和「编码对照表」两个工作表。",
+    )
+with clear_col:
+    clear_pending = st.session_state.clear_confirm_until >= time.time()
+    st.button(
+        "再次点击确认清除" if clear_pending else "清除缓存数据",
+        on_click=request_clear,
+        use_container_width=True,
+        type="secondary" if clear_pending or st.session_state.clear_password_visible else "tertiary",
+    )
 
-st.caption("提示：记录已自动追加写入本地 Excel 文件，关掉网页或刷新都不会丢数据。")
+if st.session_state.clear_password_visible:
+    with st.container(border=True):
+        st.warning("此操作会清空当前会话的编码表和计时记录，且不可恢复。请输入密码确认。")
+        st.text_input("清除密码", key="clear_password", type="password", placeholder="请输入密码（123）")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            st.button("确认清除", on_click=confirm_clear, type="primary", use_container_width=True)
+        with cancel_col:
+            st.button("取消", on_click=cancel_clear, use_container_width=True)
+
+st.markdown(
+    '<div class="fine-print">当前数据保存在此浏览器会话的 Streamlit 会话状态中；请定期下载 Excel 备份。</div>',
+    unsafe_allow_html=True,
+)
